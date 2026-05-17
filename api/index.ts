@@ -1,6 +1,5 @@
 import express from "express";
 import path from "path";
-import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import Groq from "groq-sdk";
 import Busboy from "busboy";
@@ -8,7 +7,7 @@ import Busboy from "busboy";
 async function startServer() {
   console.log("[SYSTEM] Initializing server sequence...");
   const app = express();
-  const PORT = 3000;
+  const PORT = process.env.PORT || 3000;
 
   const clientGeminiKey = process.env.GEMINI_API_KEY;
   const clientGroqKey = process.env.GROQ_API_KEY;
@@ -18,7 +17,7 @@ async function startServer() {
   }
 
   const ai = new GoogleGenAI({
-    apiKey: clientGeminiKey || "",
+    apiKey: clientGeminiKey || "DUMMY_KEY",
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -34,9 +33,8 @@ async function startServer() {
     jsonSchema?: any 
   }, retryCount = 0) {
     const MAX_RETRIES = 2;
-    const modelName = "gemini-1.5-flash"; // More stable model with potentially better quota
+    const modelName = "gemini-1.5-flash"; 
 
-    // Try Gemini first
     try {
       console.log(`Attempting Gemini generation (${modelName}, Try ${retryCount + 1})...`);
       const genConfig: any = {};
@@ -59,9 +57,8 @@ async function startServer() {
         geminiError?.status === 429 || 
         geminiError?.message?.includes("RESOURCE_EXHAUSTED");
 
-      // If it's a quota error and we have retries left, wait and retry
       if (isQuotaError && retryCount < MAX_RETRIES) {
-        const delay = (retryCount + 1) * 5000; // 5s, 10s backoff
+        const delay = (retryCount + 1) * 5000; 
         console.log(`Gemini rate limited. Retrying in ${delay}ms...`);
         await new Promise(r => setTimeout(r, delay));
         return callLLM(options, retryCount + 1);
@@ -104,18 +101,15 @@ async function startServer() {
     }
   }
 
-  // IMPORTANT: Move upload route BEFORE express.json middleware to avoid body size limits being applied by middleware to multipart/form-data
-  // API Route: Extract text from PDF
   app.post("/api/upload", (req, res) => {
     console.log("[STORAGE] Upload request received.");
     
-    // Set a timeout for the response to prevent dangling requests if PDF parsing hangs
     const responseTimeout = setTimeout(() => {
       if (!res.headersSent) {
         console.error("[STORAGE] Upload request timed out (30s).");
         res.status(504).json({ error: "The document extraction is taking too long. Please try a smaller file." });
       }
-    }, 28000); // slightly less than Vercel's typical 30s limit
+    }, 28000);
 
     const busboy = Busboy({ headers: req.headers });
     let extractedText = "";
@@ -140,30 +134,29 @@ async function startServer() {
             if (info.mimeType === "application/pdf") {
               console.log("[NEURAL] Starting PDF parsing sequence...");
               try {
-                // Dynamic import to handle CJS/ESM interop issues in serverless runtimes
-                const pdfModule = await import("pdf-parse");
-                const pdf = (pdfModule as any).default || pdfModule;
+                // PDF-parse can be problematic in serverless environments
+                // We use a dynamic import to avoid issues during cold start
+                const pdfLib = await import("pdf-parse");
+                const parsePdf = (pdfLib as any).default || pdfLib;
                 
-                if (typeof pdf !== 'function') {
-                  console.error("[NEURAL] PDF Parser structure invalid:", typeof pdf);
-                  throw new Error("SYSTEM_CONFIG_ERROR: Neural extraction engine module mismatch.");
+                if (typeof parsePdf !== 'function') {
+                   throw new Error("PDF_MODULE_MISMATCH: extraction engine structure invalid.");
                 }
 
-                const result = await pdf(buffer);
+                const result = await parsePdf(buffer);
                 
                 if (result && result.text) {
                   extractedText = result.text;
-                  console.log(`[NEURAL] PDF parsed successfully. Lines: ${extractedText.split('\n').length}`);
+                  console.log(`[NEURAL] PDF parsed successfully.`);
                 } else {
-                  throw new Error("EMPTY_EXTRACTION: No recognizable text was found in this document.");
+                  throw new Error("EMPTY_EXTRACTION: No text found.");
                 }
               } catch (pdfErr: any) {
                 console.error("[NEURAL] PDF Parsing failed internally:", pdfErr);
-                throw pdfErr;
+                throw new Error(`PDF_PARSING_FAILED: ${pdfErr.message}`);
               }
             } else {
               extractedText = buffer.toString("utf-8");
-              console.log(`[STORAGE] Text file parsed. Length: ${extractedText.length}`);
             }
             resolve(true);
           } catch (err: any) {
@@ -185,22 +178,19 @@ async function startServer() {
 
     busboy.on("finish", async () => {
       clearTimeout(responseTimeout);
-      console.log("[STORAGE] Busboy finish event triggered.");
       try {
         await Promise.all(processingPromises);
         if (errorOccurred) {
-          console.error("[STORAGE] Returning error response:", errorMessage);
           return res.status(500).json({ error: errorMessage });
         }
         if (!extractedText) {
-          return res.status(400).json({ error: "No content could be extracted from the file." });
+          return res.status(400).json({ error: "No content extracted." });
         }
-        console.log("[STORAGE] Clean extraction. Sending success response.");
         res.json({ text: extractedText, fileName });
       } catch (finalErr: any) {
         console.error("[STORAGE] Finalization crash:", finalErr);
         if (!res.headersSent) {
-          res.status(500).json({ error: "Systems failure during final assembly of document data." });
+          res.status(500).json({ error: "Systems failure during final assembly." });
         }
       }
     });
@@ -209,39 +199,24 @@ async function startServer() {
       clearTimeout(responseTimeout);
       console.error("[STORAGE] Busboy Global Error:", err);
       if (!res.headersSent) {
-        res.status(500).json({ error: "Communication link failure (Busboy Error)." });
+        res.status(500).json({ error: "Communication link failure." });
       }
     });
 
     req.pipe(busboy);
   });
 
-  app.use(express.json({ limit: '50mb' })); // Increased limit for JSON requests if needed
+  app.use(express.json({ limit: '50mb' }));
 
-  // API Route: Generate Quiz
   app.post("/api/generate-quiz", async (req, res) => {
     const { content, count, difficulty, style = "mixed" } = req.body;
-    
-    if (!content) {
-      return res.status(400).json({ error: "Document content is empty. Please upload a file first." });
-    }
+    if (!content) return res.status(400).json({ error: "Content empty" });
 
     try {
-      console.log("Generating quiz for content length:", content.length);
-      const prompt = `You are an expert educational assessment engineer. Your task is to generate a high-quality MCQ quiz based ONLY on the provided source content.
-
-STRICT RULES:
-1. TRUTHFULNESS: Every question and answer must be explicitly supported by the source content. DO NOT use outside knowledge.
-2. DISTRACTORS: Options should be plausible but clearly incorrect based on the text.
-3. EXPLANATIONS: Provide a deep, pedagogical explanation for WHY the correct answer is right, citing or paraphrasing the document.
-
-CONTEXT DATA:
-${content.substring(0, 30000)}
-
-QUIZ PARAMETERS:
-- Question Count: ${count}
-- Difficulty Level: ${difficulty}
-- Stylistic Focus: ${style} (Conceptual, Analytical, or Application-based)`;
+      const prompt = `Generate a high-quality MCQ quiz based ONLY on the provided source content. Return JSON.
+      
+      CONTEXT: ${content.substring(0, 30000)}
+      PARAMS: Count ${count}, Difficulty ${difficulty}, Style ${style}`;
 
       const result = await callLLM({
         geminiPrompt: prompt,
@@ -255,11 +230,7 @@ QUIZ PARAMETERS:
                 type: Type.OBJECT,
                 properties: {
                   question: { type: Type.STRING },
-                  options: { 
-                    type: Type.ARRAY, 
-                    items: { type: Type.STRING },
-                    description: "List of 4 multiple choice options"
-                  },
+                  options: { type: Type.ARRAY, items: { type: Type.STRING } },
                   correctAnswer: { type: Type.STRING },
                   explanation: { type: Type.STRING },
                   difficulty: { type: Type.STRING }
@@ -274,39 +245,17 @@ QUIZ PARAMETERS:
 
       res.json(JSON.parse(result.text || "{}"));
     } catch (error: any) {
-      console.error("Quiz generation error:", error);
-      res.status(500).json({ error: error.message || "Failed to generate quiz" });
+      res.status(500).json({ error: error.message });
     }
   });
 
-  // API Route: Generate Summary
   app.post("/api/generate-summary", async (req, res) => {
     const { content, type = "detailed" } = req.body;
-    
-    if (!content) {
-      return res.status(400).json({ error: "Document content is empty." });
-    }
+    if (!content) return res.status(400).json({ error: "Content empty" });
 
     try {
-      const promptMap: Record<string, string> = {
-        concise: "Extract the core 3-5% of the most critical information into a single powerful paragraph. Focus on the 'Why' behind the facts.",
-        detailed: "Provide a multi-section comprehensive breakdown using professional academic headings. Include an 'Overview', 'Key Pillars', 'Advanced Analysis', and 'Critical Takeaways'.",
-        bullets: "Create an organized list of high-impact bullet points. Use bolding for key terms and group points by logical themes.",
-        exam: "Identify key terminology, potential exam topics, and create a 'Cheat Sheet' format. Highlight definitions that are likely to be tested."
-      };
-
-      const prompt = `You are a high-level academic research assistant specializing in information synthesis.
-Your goal is to transform the provided source content into a ${type} summary that remains 100% faithful to the text.
-
-STRICT GROUNDING RULES:
-1. ONLY use information provided in the source.
-2. If the source contains contradictory information, note it as "Ambiguity in source".
-3. Maintain the technical depth of the original document.
-
-SPECIFIC OBJECTIVE: ${promptMap[type] || promptMap.detailed}
-
-SOURCE CONTENT:
-${content.substring(0, 40000)} // Increased limit slightly for better RAG context`;
+      const prompt = `Synthesize the source document into a ${type} summary.
+      SOURCE: ${content.substring(0, 40000)}`;
 
       const result = await callLLM({
         geminiPrompt: prompt,
@@ -315,145 +264,19 @@ ${content.substring(0, 40000)} // Increased limit slightly for better RAG contex
 
       res.json({ summary: result.text });
     } catch (error: any) {
-      console.error("Summary generation error:", error);
-      res.status(500).json({ error: error.message || "Failed to generate summary" });
-    }
-  });
-
-  // New API Route: Generate Flashcards
-  app.post("/api/generate-flashcards", async (req, res) => {
-    const { content } = req.body;
-    if (!content) return res.status(400).json({ error: "Content is required" });
-
-    try {
-      const prompt = `Generate a set of 8-12 high-yield flashcards (Anki-style) based on the provided text.
-Each flashcard must have a 'front' (question or term) and a 'back' (answer or definition).
-Focus on core concepts, definitions, and causal relationships.
-
-SOURCE CONTENT:
-${content.substring(0, 30000)}`;
-
-      const result = await callLLM({
-        geminiPrompt: prompt,
-        groqPrompt: prompt,
-        jsonSchema: {
-          type: Type.OBJECT,
-          properties: {
-            flashcards: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  front: { type: Type.STRING },
-                  back: { type: Type.STRING },
-                  category: { type: Type.STRING }
-                },
-                required: ["front", "back"]
-              }
-            }
-          },
-          required: ["flashcards"]
-        }
-      });
-
-      res.json(JSON.parse(result.text || '{"flashcards": []}'));
-    } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
   });
 
-  // New API Route: Extract Insights
-  app.post("/api/extract-insights", async (req, res) => {
-    const { content } = req.body;
-    if (!content) return res.status(400).json({ error: "Content is required" });
-
-    try {
-      const prompt = `Analyze the following technical document and extract "Hidden Connections" and "Critical Vulnerabilities" in the logic or findings.
-Provide a list of "Deep Insights" that aren't immediately obvious but are supported by the data.
-
-FORMAT: Use Markdown with distinct sections.
-
-SOURCE CONTENT:
-${content.substring(0, 30000)}`;
-
-      const result = await callLLM({
-        geminiPrompt: prompt,
-        groqPrompt: prompt
-      });
-
-      res.json({ insights: result.text });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // New API Route: Topic Analysis
-  app.post("/api/topic-analysis", async (req, res) => {
-    const { content } = req.body;
-    if (!content) return res.status(400).json({ error: "Content is required" });
-
-    try {
-      const prompt = `Analyze the provided source text and identify the top 5-7 most important academic or technical topics.
-For each topic, provide a 'relevance' score from 1-100 and a 1-sentence 'description' of how it is addressed in the text.
-
-SOURCE CONTENT:
-${content.substring(0, 30000)}`;
-
-      const result = await callLLM({
-        geminiPrompt: prompt,
-        groqPrompt: prompt,
-        jsonSchema: {
-          type: Type.OBJECT,
-          properties: {
-            topics: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  name: { type: Type.STRING },
-                  relevance: { type: Type.NUMBER },
-                  description: { type: Type.STRING }
-                },
-                required: ["name", "relevance", "description"]
-              }
-            }
-          },
-          required: ["topics"]
-        }
-      });
-
-      res.json(JSON.parse(result.text || '{"topics": []}'));
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // New API Route: Semantic Chat
   app.post("/api/chat", async (req, res) => {
     const { message, history, content } = req.body;
     if (!content) return res.status(400).json({ error: "Context is required" });
 
     try {
-      const prompt = `You are a Semantic Intelligence Engine (Neural-GPT-X). Your primary function is to provide ultra-accurate, context-aware synthesis of the source document.
-      
-SYSTEM CAPABILITIES:
-- Advanced Vector Retrieval Simulation (RAG)
-- Multi-step Reasoning
-- Strict Contextual Adherence
-
-SOURCE INTELLIGENCE LAYER:
-${content.substring(0, 40000)}
-
-NEURAL CHAT REGISTRY (HISTORY):
-${history.map((h: any) => `${h.role}: ${h.content}`).join("\n")}
-
-INCOMING QUERY: ${message}
-
-OPERATIONAL PARAMETERS:
-1. Respond with high technical precision.
-2. If the user asks for something outside the source, explicitly state: "QUERY_OUT_OF_BOUNDS: This specific dataset is not indexed in the current source layer."
-3. Synthesize fragmented information across the document if necessary.
-4. Use academic, authoritative tone.`;
+      const prompt = `Respond to the query based on the document.
+      DOC: ${content.substring(0, 40000)}
+      HISTORY: ${JSON.stringify(history)}
+      QUERY: ${message}`;
 
       const result = await callLLM({
         geminiPrompt: prompt,
@@ -466,148 +289,9 @@ OPERATIONAL PARAMETERS:
     }
   });
 
-  // New API Route: Knowledge Graph
-  app.post("/api/knowledge-graph", async (req, res) => {
-    const { content } = req.body;
-    if (!content) return res.status(400).json({ error: "Content is required" });
-
-    try {
-      const prompt = `You are a Semantic Cartographer. Analyze the provided document and construct a high-fidelity Knowledge Graph.
-Extract key technical entities, concepts, dates, and figures as nodes.
-Define explicit relationships between these entities as links.
-
-STRICT ONTOLOGY RULES:
-1. ENTITIES (Nodes): Group concepts into logical categories (1: Core Subject, 2: Supporting Tech, 3: Temporal/Historical, 4: Quantitative Data).
-2. WEIGHTS: Assign 'val' (1-10) based on cognitive importance.
-3. LINKS (Edges): Use specific relationship types as values (1: Related, 3: Prerequisite, 5: Core dependency).
-4. INTEGRITY: Every 'source' and 'target' in the links list MUST match an 'id' in the nodes list exactly.
-5. DENSITY: Aim for 20-30 high-quality nodes and 25-45 links. Do NOT include generic terms like "The" or "And".
-
-SOURCE CONTENT:
-${content.substring(0, 30000)}`;
-
-      const result = await callLLM({
-        geminiPrompt: prompt,
-        groqPrompt: prompt,
-        jsonSchema: {
-          type: Type.OBJECT,
-          properties: {
-            nodes: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  id: { type: Type.STRING, description: "Unique name of the entity" },
-                  group: { type: Type.NUMBER, description: "Category index 1-4" },
-                  val: { type: Type.NUMBER, description: "Scale of 1-10" }
-                },
-                required: ["id", "group", "val"]
-              }
-            },
-            links: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  source: { type: Type.STRING, description: "Match a Node ID" },
-                  target: { type: Type.STRING, description: "Match a Node ID" },
-                  value: { type: Type.NUMBER, description: "Strength 1-5" }
-                },
-                required: ["source", "target", "value"]
-              }
-            }
-          },
-          required: ["nodes", "links"]
-        }
-      });
-
-      const parsed = JSON.parse(result.text || '{"nodes":[], "links":[]}');
-      
-      // Post-processing to ensure link integrity
-      const nodeIds = new Set(parsed.nodes?.map((n: any) => n.id) || []);
-      const validatedLinks = (parsed.links || []).filter((l: any) => nodeIds.has(l.source) && nodeIds.has(l.target));
-      
-      res.json({
-        nodes: parsed.nodes || [],
-        links: validatedLinks
-      });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // New API Route: Predictive Assessment
-  app.post("/api/predictive-assessment", async (req, res) => {
-    const { results, content } = req.body;
-    if (!content || !results) return res.status(400).json({ error: "Context and results are required" });
-
-    try {
-      const prompt = `As a Neural Psychometrician, analyze the user's performance on the recently administered quiz.
-Match the user's incorrect responses to specific conceptual domains within the source document.
-Predict exactly which sections or topics the user will struggle with in a professional exam.
-
-SOURCE DOCUMENT:
-${content.substring(0, 30000)}
-
-QUIZ RESULTS:
-Score: ${results.score}/${results.total}
-Detailed Answers: ${JSON.stringify(results.answers)}
-
-Return a structured breakdown of:
-1. "Vulnerability Vectors" (Predicted areas of failure)
-2. "Cognitive Strategy" (How to bridge the gap)
-3. "Exam Risk Level" (Low/Medium/High)
-Use Markdown for the response.`;
-
-      const result = await callLLM({
-        geminiPrompt: prompt,
-        groqPrompt: prompt
-      });
-
-      res.json({ assessment: result.text });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // New API Route: Multimodal Fact Check
-  app.post("/api/fact-check", async (req, res) => {
-    const { claims, content } = req.body;
-    if (!content) return res.status(400).json({ error: "Context is required" });
-
-    try {
-      const prompt = `Cross-reference the key claims in the following document with real-time research and external data.
-Identify any assertions that might be outdated, controversial, or require further verification.
-
-DOC CONTENT TO VERIFY:
-${claims || content.substring(0, 5000)}
-
-RULES:
-1. Use Google Search to verify claims.
-2. Provide links to supporting or refuting evidence by citing the URLs in the text.
-3. Be objective and critical.`;
-
-      // Use Gemini with Search Grounding
-      const response = await ai.models.generateContent({
-        model: "gemini-1.5-flash",
-        contents: prompt,
-        config: {
-          tools: [{ googleSearch: {} }],
-        },
-      });
-
-      const grounding = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-      res.json({ 
-        analysis: response.text,
-        sources: grounding.map((g: any) => g.web?.uri).filter(Boolean)
-      });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== "production") {
+  // Handle other endpoints similarly or redirect to frontend
+  if (process.env.NODE_ENV !== "production" && !process.env.VERCEL) {
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
@@ -616,47 +300,45 @@ RULES:
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
+    // Important: for Vercel, this might not be reached due to rewrites, but good for local production tests
     app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
-  // Only listen if not in a Vercel environment
-  if (!process.env.VERCEL) {
-    console.log("[SYSTEM] Non-Vercel environment detected. Binding to port...");
-    app.listen(PORT, "0.0.0.0", () => {
-      console.log(`[SUCCESS] Neural Engine Online at http://0.0.0.0:${PORT}`);
-    });
-  }
-  
-  // Global error handler
   app.use((err: any, req: any, res: any, next: any) => {
-    console.error("[GLOBAL ERROR]", err);
+    console.error("[CRITICAL]", err);
     if (!res.headersSent) {
-      res.status(500).json({ 
-        error: "Internal Neural Collision", 
-        message: err.message || "An unexpected system error occurred" 
-      });
+      res.status(500).json({ error: "Internal Server Error", message: err.message });
     }
   });
 
   return app;
 }
 
-const appPromise = startServer();
+// Optimization for Vercel: We don't want to start the server unless strictly needed or we wrap it correctly
+let cachedApp: any = null;
 
 export default async (req: any, res: any) => {
   try {
-    const app = await appPromise;
-    return app(req, res);
+    if (!cachedApp) {
+      cachedApp = await startServer();
+    }
+    
+    // Safety check for Vercel: if we're somehow here but shouldn't listen
+    if (!process.env.VERCEL && !cachedApp._listening) {
+       const PORT = process.env.PORT || 3000;
+       cachedApp.listen(PORT, "0.0.0.0", () => {
+         console.log(`Server listening on ${PORT}`);
+         cachedApp._listening = true;
+       });
+    }
+
+    return cachedApp(req, res);
   } catch (err: any) {
-    console.error("[CRITICAL] Request handling failed:", err);
+    console.error("[BOOT ERROR]", err);
     if (!res.headersSent) {
-      res.status(500).json({ 
-        error: "Neural Core Synchronization Failure", 
-        details: err.message,
-        stack: process.env.NODE_ENV === "development" ? err.stack : undefined
-      });
+      res.status(500).end(`Internal Startup Error: ${err.message}`);
     }
   }
 };
