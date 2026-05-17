@@ -91,10 +91,21 @@ async function startServer() {
   // IMPORTANT: Move upload route BEFORE express.json middleware to avoid body size limits being applied by middleware to multipart/form-data
   // API Route: Extract text from PDF
   app.post("/api/upload", (req, res) => {
+    console.log("[STORAGE] Upload request received.");
+    
+    // Set a timeout for the response to prevent dangling requests if PDF parsing hangs
+    const responseTimeout = setTimeout(() => {
+      if (!res.headersSent) {
+        console.error("[STORAGE] Upload request timed out (30s).");
+        res.status(504).json({ error: "The document extraction is taking too long. Please try a smaller file." });
+      }
+    }, 28000); // slightly less than Vercel's typical 30s limit
+
     const busboy = Busboy({ headers: req.headers });
-    let text = "";
+    let extractedText = "";
     let fileName = "";
     let errorOccurred = false;
+    let errorMessage = "";
     const processingPromises: Promise<any>[] = [];
 
     busboy.on("file", (fieldname, file, info) => {
@@ -111,37 +122,44 @@ async function startServer() {
           console.log(`[STORAGE] File ${fileName} fully received. Size: ${buffer.length} bytes`);
           try {
             if (info.mimeType === "application/pdf") {
-              console.log("[NERAL] Parsing PDF stream...");
+              console.log("[NEURAL] Starting PDF parsing sequence...");
+              // Robust attempt at importing pdf-parse
+              let parsePdf;
               try {
-                // Runtime check for pdf-parse export variability
-                const parsePdf = (pdf as any).default || pdf;
-                const result = await parsePdf(buffer);
-                
-                if (result && result.text) {
-                  text = result.text;
-                  console.log(`[NEURAL] PDF parsed. Extracted text length: ${text.length}`);
-                } else {
-                  throw new Error("NULL_EXTRACTION: PDF parser returned no text. The document might be image-based or protected.");
+                // Try to handle different export styles in serverless environments
+                parsePdf = (pdf as any).default || pdf;
+                if (typeof parsePdf !== 'function') {
+                  throw new Error("PDF_MODULE_CONFIG_ERROR: pdf-parse export is not a function.");
                 }
-              } catch (err: any) {
-                console.error("[NEURAL] PDF Parse Error:", err);
-                throw err;
+              } catch (importErr: any) {
+                console.error("[NEURAL] PDF Module Import Failure:", importErr);
+                throw new Error("SYSTEM_MODULE_ERROR: Could not initialize neural extraction engine.");
+              }
+
+              const result = await parsePdf(buffer);
+              
+              if (result && result.text) {
+                extractedText = result.text;
+                console.log(`[NEURAL] PDF parsed successfully. Lines: ${extractedText.split('\n').length}`);
+              } else {
+                throw new Error("EMPTY_EXTRACTION: No recognizable text was found in this document.");
               }
             } else {
-              text = buffer.toString("utf-8");
-              console.log(`[STORAGE] Text file parsed. Length: ${text.length}`);
+              extractedText = buffer.toString("utf-8");
+              console.log(`[STORAGE] Text file parsed. Length: ${extractedText.length}`);
             }
             resolve(true);
           } catch (err: any) {
-            console.error("[STORAGE] Processing Error:", err);
+            console.error("[STORAGE] Worker process failed:", err);
             errorOccurred = true;
-            text = `ERROR: ${err.message}`;
+            errorMessage = err.message || "Unknown error during document parsing.";
             resolve(false);
           }
         });
         file.on("error", (err) => {
           console.error("[STREAM] File Stream Error:", err);
           errorOccurred = true;
+          errorMessage = "Stream interruption during file transfer.";
           resolve(false);
         });
       });
@@ -149,22 +167,32 @@ async function startServer() {
     });
 
     busboy.on("finish", async () => {
-      console.log("[STORAGE] Busboy stream finished.");
-      await Promise.all(processingPromises);
-      if (errorOccurred || !text) {
-        console.error("[STORAGE] Upload terminal state failure.");
-        return res.status(500).json({ 
-          error: text.startsWith("ERROR:") ? text.replace("ERROR: ", "") : "Failed to extract text from the document. It might be corrupted or in an unsupported format." 
-        });
+      clearTimeout(responseTimeout);
+      console.log("[STORAGE] Busboy finish event triggered.");
+      try {
+        await Promise.all(processingPromises);
+        if (errorOccurred) {
+          console.error("[STORAGE] Returning error response:", errorMessage);
+          return res.status(500).json({ error: errorMessage });
+        }
+        if (!extractedText) {
+          return res.status(400).json({ error: "No content could be extracted from the file." });
+        }
+        console.log("[STORAGE] Clean extraction. Sending success response.");
+        res.json({ text: extractedText, fileName });
+      } catch (finalErr: any) {
+        console.error("[STORAGE] Finalization crash:", finalErr);
+        if (!res.headersSent) {
+          res.status(500).json({ error: "Systems failure during final assembly of document data." });
+        }
       }
-      console.log("[STORAGE] Upload success.");
-      res.json({ text, fileName });
     });
 
     busboy.on("error", (err) => {
+      clearTimeout(responseTimeout);
       console.error("[STORAGE] Busboy Global Error:", err);
       if (!res.headersSent) {
-        res.status(500).json({ error: "Communication error during upload." });
+        res.status(500).json({ error: "Communication link failure (Busboy Error)." });
       }
     });
 
