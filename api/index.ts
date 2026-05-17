@@ -4,10 +4,13 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import Groq from "groq-sdk";
 import Busboy from "busboy";
-// @ts-ignore
-import pdf from "pdf-parse";
+import { createRequire } from "module";
+
+const require = createRequire(import.meta.url);
+const pdf = require("pdf-parse");
 
 async function startServer() {
+  console.log("[SYSTEM] Initializing server sequence...");
   const app = express();
   const PORT = 3000;
 
@@ -124,20 +127,8 @@ async function startServer() {
             if (info.mimeType === "application/pdf") {
               console.log("[NEURAL] Starting PDF parsing sequence...");
               try {
-                // Robust check for different import styles
-                let parsePdfFunc = (pdf as any).default || pdf;
-                
-                // Final fallback if it's still not a function
-                if (typeof parsePdfFunc !== 'function' && (pdf as any).pdf) {
-                   parsePdfFunc = (pdf as any).pdf;
-                }
-
-                if (typeof parsePdfFunc !== 'function') {
-                  console.error("[NEURAL] PDF module structure:", typeof pdf, Object.keys(pdf as any));
-                  throw new Error("PDF_PARSER_INIT_ERROR: The extraction engine could not be initialized.");
-                }
-                
-                const result = await parsePdfFunc(buffer);
+                // pdf-parse from require should be the function
+                const result = await pdf(buffer);
                 
                 if (result && result.text) {
                   extractedText = result.text;
@@ -609,17 +600,21 @@ RULES:
     });
   }
 
-  // Only listen if not in a serverless environment
-  if (process.env.NODE_ENV !== "production" || !process.env.VERCEL) {
+  // Only listen if not in a Vercel environment
+  if (!process.env.VERCEL) {
+    console.log("[SYSTEM] Non-Vercel environment detected. Binding to port...");
     app.listen(PORT, "0.0.0.0", () => {
-      console.log(`Server running on http://0.0.0.0:${PORT}`);
+      console.log(`[SUCCESS] Neural Engine Online at http://0.0.0.0:${PORT}`);
     });
   }
   
   return app;
 }
 
-const appPromise = startServer();
+const appPromise = startServer().catch(err => {
+  console.error("[CRITICAL] Server failed to start:", err);
+  process.exit(1);
+});
 
 export default async (req: any, res: any) => {
   const app = await appPromise;
