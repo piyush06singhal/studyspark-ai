@@ -4,7 +4,8 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import Groq from "groq-sdk";
 import Busboy from "busboy";
-import { PDFParse } from "pdf-parse";
+// @ts-ignore
+import pdf from "pdf-parse";
 
 async function startServer() {
   const app = express();
@@ -113,18 +114,17 @@ async function startServer() {
           console.log(`File ${fileName} fully received. Size: ${buffer.length} bytes`);
           try {
             if (info.mimeType === "application/pdf") {
-              console.log("Parsing PDF using PDFParse class...");
-              const parser = new PDFParse({ data: buffer });
+              console.log("Parsing PDF...");
               try {
-                const result = await parser.getText();
+                const result = await pdf(buffer);
                 if (result && result.text) {
                   text = result.text;
                   console.log(`PDF parsed. Extracted text length: ${text.length}`);
                 } else {
                   throw new Error("PDF parser returned no text. The PDF might be scanned/image-based.");
                 }
-              } finally {
-                await parser.destroy();
+              } catch (err: any) {
+                throw err;
               }
             } else {
               text = buffer.toString("utf-8");
