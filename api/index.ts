@@ -39,21 +39,26 @@ async function startServer() {
   const app = express();
   const PORT = process.env.PORT || 3000;
 
-  const clientGeminiKey = process.env.GEMINI_API_KEY;
+  const geminiKeys = Object.keys(process.env)
+    .filter(k => k.startsWith('GEMINI_API_KEY'))
+    .map(k => process.env[k])
+    .filter(Boolean) as string[];
+
   const clientGroqKey = process.env.GROQ_API_KEY;
 
-  if (!clientGeminiKey) {
-    console.warn("GEMINI_API_KEY not found in environment. AI features will be limited.");
+  if (geminiKeys.length === 0) {
+    console.warn("No GEMINI_API_KEY found in environment. AI features will be limited.");
+    geminiKeys.push("DUMMY_KEY");
   }
 
-  const ai = new GoogleGenAI({
-    apiKey: clientGeminiKey || "DUMMY_KEY",
+  const aiInstances = geminiKeys.map(key => new GoogleGenAI({
+    apiKey: key,
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
       }
     }
-  });
+  }));
 
   const groq = clientGroqKey ? new Groq({ apiKey: clientGroqKey }) : null;
 
@@ -65,30 +70,48 @@ async function startServer() {
     const MAX_RETRIES = 2;
     const modelName = "gemini-1.5-flash"; 
 
-    try {
-      console.log(`[LLM] Attempting Gemini (${modelName}, Try ${retryCount + 1})...`);
-      const genConfig: any = {};
-      if (options.jsonSchema) {
-        genConfig.responseMimeType = "application/json";
-        genConfig.responseSchema = options.jsonSchema;
+    let lastGeminiError: any = null;
+    let isGeminiQuota = false;
+
+    for (let i = 0; i < aiInstances.length; i++) {
+      const ai = aiInstances[i];
+      try {
+        console.log(`[LLM] Attempting Gemini Pool Instance ${i + 1}/${aiInstances.length} (${modelName}, Try ${retryCount + 1})...`);
+        const genConfig: any = {};
+        if (options.jsonSchema) {
+          genConfig.responseMimeType = "application/json";
+          genConfig.responseSchema = options.jsonSchema;
+        }
+
+        const response = await ai.models.generateContent({
+          model: modelName,
+          contents: options.geminiPrompt,
+          config: genConfig
+        });
+        return { source: 'gemini', text: response.text };
+      } catch (geminiError: any) {
+        lastGeminiError = geminiError;
+        
+        isGeminiQuota = 
+          geminiError?.message?.includes("429") || 
+          geminiError?.status === 429 || 
+          geminiError?.message?.includes("RESOURCE_EXHAUSTED") ||
+          geminiError?.message?.includes("API key not valid"); // Skip invalid keys seamlessly
+
+        if (isGeminiQuota) {
+          console.warn(`[LLM] Gemini Instance ${i + 1} hit quota or invalid key. Routing to next available instance...`);
+          continue; // Try next instance
+        } else {
+          console.error(`[LLM] Gemini Instance ${i + 1} failed with non-quota error:`, geminiError.message);
+          break; // Stop trying other Gemini keys if it's a generic error (e.g. malformed prompt)
+        }
       }
+    }
 
-      const response = await ai.models.generateContent({
-        model: modelName,
-        contents: options.geminiPrompt,
-        config: genConfig
-      });
-      return { source: 'gemini', text: response.text };
-    } catch (geminiError: any) {
-      console.error("[LLM] Gemini failed:", geminiError);
-      
-      const isGeminiQuota = 
-        geminiError?.message?.includes("429") || 
-        geminiError?.status === 429 || 
-        geminiError?.message?.includes("RESOURCE_EXHAUSTED");
+    console.error("[LLM] All Gemini instances in the pool failed or hit limits.");
 
-      // Attempt Groq fallback IMMEDIATELY if Gemini is rate limited or fails
-      if (groq) {
+    // Attempt Groq fallback IMMEDIATELY if Gemini is rate limited or fails
+    if (groq) {
         try {
           console.log("[LLM] Attempting Groq fallback layer...");
           const params: any = {
@@ -122,16 +145,15 @@ async function startServer() {
         }
       }
       
-      // If no Groq, but Gemini hit quota, retry Gemini with backoff
+      // If no Groq, but Gemini hit quota, retry sequence with backoff
       if (isGeminiQuota && retryCount < MAX_RETRIES) {
          const delay = (retryCount + 1) * 5000;
-         console.log(`[LLM] Gemini quota reached. Backing off for ${delay}ms...`);
+         console.log(`[LLM] Global Gemini pool quota reached. Backing off for ${delay}ms...`);
          await new Promise(r => setTimeout(r, delay));
          return callLLM(options, retryCount + 1);
       }
 
-      throw geminiError;
-    }
+      throw lastGeminiError || new Error("Unknown Neural Compute Failure.");
   }
 
   app.post("/api/upload", (req, res) => {
@@ -520,7 +542,8 @@ ${content.substring(0, 30000)}`;
       DOC: ${content.substring(0, 5000)}
       CLAIMS: ${claims}`;
 
-      const response = await ai.models.generateContent({
+      // For fact-check, just use the first available instance since tools aren't passed dynamically
+      const response = await aiInstances[0].models.generateContent({
         model: "gemini-1.5-flash",
         contents: prompt,
         config: {
