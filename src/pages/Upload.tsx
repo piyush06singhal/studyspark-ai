@@ -73,9 +73,14 @@ export default function UploadPage() {
         data = JSON.parse(text);
       } catch (e) {
         if (response.status === 413) {
-          throw new Error("The file is too large for the neural engine's current buffer (Max 4.5MB on Vercel). Please try a smaller document.");
+          throw new Error("The file is too large (Vercel Limit: 4.5MB). Please compress the PDF or use Manual Entry.");
         }
-        throw new Error(`Neural Link Error (${response.status}): The server returned an unparseable response. This usually indicates a system-level limit was exceeded.`);
+        console.error("Unparseable response text:", text);
+        // Fallback for generic errors that might return text
+        if (text && text.length < 200) {
+          throw new Error(`System Error (${response.status}): ${text}`);
+        }
+        throw new Error(`Neural Link Offline (${response.status}): The uplink returned a malformed response. Ensure your API keys are correctly configured and the file is valid.`);
       }
 
       if (!response.ok) {

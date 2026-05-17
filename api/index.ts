@@ -4,7 +4,6 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import Groq from "groq-sdk";
 import Busboy from "busboy";
-import { PDFParse } from "pdf-parse";
 
 async function startServer() {
   console.log("[SYSTEM] Initializing server sequence...");
@@ -140,10 +139,17 @@ async function startServer() {
           try {
             if (info.mimeType === "application/pdf") {
               console.log("[NEURAL] Starting PDF parsing sequence...");
-              let parser: PDFParse | null = null;
               try {
-                parser = new PDFParse({ data: buffer });
-                const result = await parser.getText();
+                // Dynamic import to handle CJS/ESM interop issues in serverless runtimes
+                const pdfModule = await import("pdf-parse");
+                const pdf = (pdfModule as any).default || pdfModule;
+                
+                if (typeof pdf !== 'function') {
+                  console.error("[NEURAL] PDF Parser structure invalid:", typeof pdf);
+                  throw new Error("SYSTEM_CONFIG_ERROR: Neural extraction engine module mismatch.");
+                }
+
+                const result = await pdf(buffer);
                 
                 if (result && result.text) {
                   extractedText = result.text;
@@ -154,10 +160,6 @@ async function startServer() {
               } catch (pdfErr: any) {
                 console.error("[NEURAL] PDF Parsing failed internally:", pdfErr);
                 throw pdfErr;
-              } finally {
-                if (parser) {
-                  await parser.destroy().catch(() => {});
-                }
               }
             } else {
               extractedText = buffer.toString("utf-8");
@@ -627,15 +629,34 @@ RULES:
     });
   }
   
+  // Global error handler
+  app.use((err: any, req: any, res: any, next: any) => {
+    console.error("[GLOBAL ERROR]", err);
+    if (!res.headersSent) {
+      res.status(500).json({ 
+        error: "Internal Neural Collision", 
+        message: err.message || "An unexpected system error occurred" 
+      });
+    }
+  });
+
   return app;
 }
 
-const appPromise = startServer().catch(err => {
-  console.error("[CRITICAL] Server failed to start:", err);
-  process.exit(1);
-});
+const appPromise = startServer();
 
 export default async (req: any, res: any) => {
-  const app = await appPromise;
-  return app(req, res);
+  try {
+    const app = await appPromise;
+    return app(req, res);
+  } catch (err: any) {
+    console.error("[CRITICAL] Request handling failed:", err);
+    if (!res.headersSent) {
+      res.status(500).json({ 
+        error: "Neural Core Synchronization Failure", 
+        details: err.message,
+        stack: process.env.NODE_ENV === "development" ? err.stack : undefined
+      });
+    }
+  }
 };
