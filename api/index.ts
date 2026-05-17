@@ -98,7 +98,7 @@ async function startServer() {
           
           if (options.jsonSchema) {
             params.response_format = { type: "json_object" };
-            params.messages[0].content += "\n\nCRITICAL: Return a valid JSON object matching the requested schema. Do not include any other text besides the JSON.";
+            params.messages[0].content += `\n\nCRITICAL: Return a valid JSON object matching this exact schema: ${JSON.stringify(options.jsonSchema)}. Do not include any other text besides the JSON.`;
           }
 
           const completion = await groq.chat.completions.create(params);
