@@ -4,10 +4,7 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import Groq from "groq-sdk";
 import Busboy from "busboy";
-import { createRequire } from "module";
-
-const require = createRequire(import.meta.url);
-const pdf = require("pdf-parse");
+import { PDFParse } from "pdf-parse";
 
 async function startServer() {
   console.log("[SYSTEM] Initializing server sequence...");
@@ -37,9 +34,12 @@ async function startServer() {
     groqPrompt: string, 
     jsonSchema?: any 
   }, retryCount = 0) {
+    const MAX_RETRIES = 2;
+    const modelName = "gemini-1.5-flash"; // More stable model with potentially better quota
+
     // Try Gemini first
     try {
-      console.log(`Attempting Gemini generation (Try ${retryCount + 1})...`);
+      console.log(`Attempting Gemini generation (${modelName}, Try ${retryCount + 1})...`);
       const genConfig: any = {};
       if (options.jsonSchema) {
         genConfig.responseMimeType = "application/json";
@@ -47,7 +47,7 @@ async function startServer() {
       }
 
       const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
+        model: modelName,
         contents: options.geminiPrompt,
         config: genConfig
       });
@@ -55,7 +55,18 @@ async function startServer() {
     } catch (geminiError: any) {
       console.error("Gemini failed:", geminiError);
       
-      const isQuotaError = geminiError?.message?.includes("429") || geminiError?.status === 429;
+      const isQuotaError = 
+        geminiError?.message?.includes("429") || 
+        geminiError?.status === 429 || 
+        geminiError?.message?.includes("RESOURCE_EXHAUSTED");
+
+      // If it's a quota error and we have retries left, wait and retry
+      if (isQuotaError && retryCount < MAX_RETRIES) {
+        const delay = (retryCount + 1) * 5000; // 5s, 10s backoff
+        console.log(`Gemini rate limited. Retrying in ${delay}ms...`);
+        await new Promise(r => setTimeout(r, delay));
+        return callLLM(options, retryCount + 1);
+      }
 
       if (groq) {
         try {
@@ -78,13 +89,16 @@ async function startServer() {
         } catch (groqError: any) {
           console.error("Groq fallback also failed:", groqError);
           
-          if (retryCount < 1 && (isQuotaError || groqError?.status === 429)) {
-             console.log("Both services hit rate limits. Retrying in 2 seconds...");
-             await new Promise(r => setTimeout(r, 2000));
+          const isGroqQuota = groqError?.status === 429 || groqError?.message?.includes("rate_limit_exceeded");
+
+          if (retryCount < MAX_RETRIES && (isQuotaError || isGroqQuota)) {
+             const delay = (retryCount + 1) * 5000;
+             console.log(`Both services hit rate limits or Groq failed. Retrying in ${delay}ms... (Try ${retryCount + 2})`);
+             await new Promise(r => setTimeout(r, delay));
              return callLLM(options, retryCount + 1);
           }
 
-          throw new Error("Neural Compute Overloaded: Both AI processing layers are currently at capacity. Please wait 30 seconds and retry extraction.");
+          throw new Error("Neural Compute Overloaded: Both AI processing layers are currently at capacity. Please wait 60 seconds and retry extraction.");
         }
       }
       throw geminiError;
@@ -126,9 +140,10 @@ async function startServer() {
           try {
             if (info.mimeType === "application/pdf") {
               console.log("[NEURAL] Starting PDF parsing sequence...");
+              let parser: PDFParse | null = null;
               try {
-                // pdf-parse from require should be the function
-                const result = await pdf(buffer);
+                parser = new PDFParse({ data: buffer });
+                const result = await parser.getText();
                 
                 if (result && result.text) {
                   extractedText = result.text;
@@ -139,6 +154,10 @@ async function startServer() {
               } catch (pdfErr: any) {
                 console.error("[NEURAL] PDF Parsing failed internally:", pdfErr);
                 throw pdfErr;
+              } finally {
+                if (parser) {
+                  await parser.destroy().catch(() => {});
+                }
               }
             } else {
               extractedText = buffer.toString("utf-8");
@@ -568,7 +587,7 @@ RULES:
 
       // Use Gemini with Search Grounding
       const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
+        model: "gemini-1.5-flash",
         contents: prompt,
         config: {
           tools: [{ googleSearch: {} }],

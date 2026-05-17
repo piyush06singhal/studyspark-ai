@@ -20,7 +20,7 @@ NeuralContext is a high-fidelity document analysis and synthesis platform. It tr
 - **Icons**: Lucide React
 - **Backend**: Node.js, Express
 - **AI Core**: 
-  - **Primary**: Google Gemini API (models/gemini-3-flash-preview)
+  - **Primary**: Google Gemini API (models/gemini-1.5-flash)
   - **Fallback**: Groq (Llama 3.3 70B)
   - **Search**: Google Search Grounding for fact-checking
 
