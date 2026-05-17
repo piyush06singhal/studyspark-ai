@@ -231,6 +231,14 @@ async function startServer() {
       }
     });
 
+    req.on("error", (err) => {
+      clearTimeout(responseTimeout);
+      console.error("[STORAGE] Request Stream Error:", err);
+      if (!res.headersSent) {
+        res.status(400).json({ error: "Upload interrupted or exceeded platform limits." });
+      }
+    });
+
     req.pipe(busboy);
   });
 
