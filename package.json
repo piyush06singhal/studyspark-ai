@@ -31,7 +31,7 @@
     "groq-sdk": "^1.2.0",
     "lucide-react": "^0.546.0",
     "motion": "^12.38.0",
-    "pdf-parse": "^2.4.5",
+    "pdf-parse": "^1.1.1",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "react-dropzone": "^15.0.0",
