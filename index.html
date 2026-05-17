@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NeuroPrep AI | Master Your Study Materials</title>
+    <script>
+      // Prevent third-party libraries from attempting to redefine fetch, 
+      // which can cause "Cannot set property fetch of #<Window> which has only a getter" errors.
+      (function() {
+        const originalFetch = window.fetch;
+        if (Object.getOwnPropertyDescriptor(window, 'fetch')?.writable === false) {
+           // It's already read-only, we're good unless some library uses = instead of Object.defineProperty
+        } else {
+           try {
+             Object.defineProperty(window, 'fetch', {
+               configurable: false,
+               enumerable: true,
+               get: function() { return originalFetch; }
+             });
+           } catch (e) {
+             console.warn("Could not lock window.fetch");
+           }
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

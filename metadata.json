@@ -1,0 +1,11 @@
+{
+  "name": "NeuroPrep AI",
+  "description": "Futuristic AI-powered EdTech platform that transforms study materials into intelligent quizzes and summaries.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
