@@ -3,16 +3,32 @@ import path from "path";
 import { GoogleGenAI, Type } from "@google/genai";
 import Groq from "groq-sdk";
 import Busboy from "busboy";
+import { createRequire } from "module";
 
-// Polyfill for DOMMatrix which is sometimes missing in Node.js environments and required by pdf.js (inner dependency of pdf-parse)
+const require = createRequire(import.meta.url);
+const pdf = require("pdf-parse");
+
+// Polyfill for DOMMatrix and other globals needed by pdf.js in Node.js
 if (typeof global.DOMMatrix === 'undefined') {
-  (global as any).DOMMatrix = class DOMMatrix {
+  const DOMMatrixPolyfill = class DOMMatrix {
     a = 1; b = 0; c = 0; d = 1; e = 0; f = 0;
     constructor(init?: any) {
       if (typeof init === 'string') return;
       if (Array.isArray(init)) {
         this.a = init[0]; this.b = init[1]; this.c = init[2]; this.d = init[3]; this.e = init[4]; this.f = init[5];
       }
+    }
+  };
+  (global as any).DOMMatrix = DOMMatrixPolyfill;
+}
+
+// Ensure ImageData is also defined as it's sometimes checked by pdf.js versions
+if (typeof global.ImageData === 'undefined') {
+  (global as any).ImageData = class ImageData {
+    width: number; height: number; data: Uint8ClampedArray;
+    constructor(width: number, height: number) {
+      this.width = width; this.height = height;
+      this.data = new Uint8ClampedArray(width * height * 4);
     }
   };
 }
@@ -49,7 +65,7 @@ async function startServer() {
     const modelName = "gemini-1.5-flash"; 
 
     try {
-      console.log(`Attempting Gemini generation (${modelName}, Try ${retryCount + 1})...`);
+      console.log(`[LLM] Attempting Gemini (${modelName}, Try ${retryCount + 1})...`);
       const genConfig: any = {};
       if (options.jsonSchema) {
         genConfig.responseMimeType = "application/json";
@@ -63,23 +79,17 @@ async function startServer() {
       });
       return { source: 'gemini', text: response.text };
     } catch (geminiError: any) {
-      console.error("Gemini failed:", geminiError);
+      console.error("[LLM] Gemini failed:", geminiError);
       
-      const isQuotaError = 
+      const isGeminiQuota = 
         geminiError?.message?.includes("429") || 
         geminiError?.status === 429 || 
         geminiError?.message?.includes("RESOURCE_EXHAUSTED");
 
-      if (isQuotaError && retryCount < MAX_RETRIES) {
-        const delay = (retryCount + 1) * 5000; 
-        console.log(`Gemini rate limited. Retrying in ${delay}ms...`);
-        await new Promise(r => setTimeout(r, delay));
-        return callLLM(options, retryCount + 1);
-      }
-
+      // Attempt Groq fallback IMMEDIATELY if Gemini is rate limited or fails
       if (groq) {
         try {
-          console.log("Attempting Groq fallback...");
+          console.log("[LLM] Attempting Groq fallback layer...");
           const params: any = {
             messages: [{ role: "user", content: options.groqPrompt }],
             model: "llama-3.3-70b-versatile",
@@ -87,7 +97,7 @@ async function startServer() {
           
           if (options.jsonSchema) {
             params.response_format = { type: "json_object" };
-            params.messages[0].content += "\n\nCRITICAL: You must return a valid JSON object matching the requested schema. Do not include any other text besides the JSON.";
+            params.messages[0].content += "\n\nCRITICAL: Return a valid JSON object matching the requested schema. Do not include any other text besides the JSON.";
           }
 
           const completion = await groq.chat.completions.create(params);
@@ -96,13 +106,13 @@ async function startServer() {
             text: completion.choices[0]?.message?.content || "{}" 
           };
         } catch (groqError: any) {
-          console.error("Groq fallback also failed:", groqError);
+          console.error("[LLM] Groq fallback also failed:", groqError);
           
           const isGroqQuota = groqError?.status === 429 || groqError?.message?.includes("rate_limit_exceeded");
 
-          if (retryCount < MAX_RETRIES && (isQuotaError || isGroqQuota)) {
+          if (retryCount < MAX_RETRIES && (isGeminiQuota || isGroqQuota)) {
              const delay = (retryCount + 1) * 5000;
-             console.log(`Both services hit rate limits or Groq failed. Retrying in ${delay}ms... (Try ${retryCount + 2})`);
+             console.log(`[LLM] Multi-link collision. Retrying full sequence in ${delay}ms...`);
              await new Promise(r => setTimeout(r, delay));
              return callLLM(options, retryCount + 1);
           }
@@ -110,6 +120,15 @@ async function startServer() {
           throw new Error("Neural Compute Overloaded: Both AI processing layers are currently at capacity. Please wait 60 seconds and retry extraction.");
         }
       }
+      
+      // If no Groq, but Gemini hit quota, retry Gemini with backoff
+      if (isGeminiQuota && retryCount < MAX_RETRIES) {
+         const delay = (retryCount + 1) * 5000;
+         console.log(`[LLM] Gemini quota reached. Backing off for ${delay}ms...`);
+         await new Promise(r => setTimeout(r, delay));
+         return callLLM(options, retryCount + 1);
+      }
+
       throw geminiError;
     }
   }
@@ -147,16 +166,11 @@ async function startServer() {
             if (info.mimeType === "application/pdf") {
               console.log("[NEURAL] Starting PDF parsing sequence...");
               try {
-                // PDF-parse can be problematic in serverless environments
-                // We use a dynamic import to avoid issues during cold start
-                const pdfLib = await import("pdf-parse");
-                const parsePdf = (pdfLib as any).default || pdfLib;
-                
-                if (typeof parsePdf !== 'function') {
+                if (typeof pdf !== 'function') {
                    throw new Error("PDF_MODULE_MISMATCH: extraction engine structure invalid.");
                 }
 
-                const result = await parsePdf(buffer);
+                const result = await pdf(buffer);
                 
                 if (result && result.text) {
                   extractedText = result.text;
@@ -534,36 +548,27 @@ ${content.substring(0, 30000)}`;
   app.use((err: any, req: any, res: any, next: any) => {
     console.error("[CRITICAL]", err);
     if (!res.headersSent) {
-      res.status(500).json({ error: "Internal Server Error", message: err.message });
+      res.status(500).json({ 
+        error: "Internal Server Error", 
+        message: err.message,
+        type: err.name
+      });
     }
   });
 
   return app;
 }
 
-// Optimization for Vercel: We don't want to start the server unless strictly needed or we wrap it correctly
-let cachedApp: any = null;
+const appPromise = startServer();
 
 export default async (req: any, res: any) => {
   try {
-    if (!cachedApp) {
-      cachedApp = await startServer();
-    }
-    
-    // Safety check for Vercel: if we're somehow here but shouldn't listen
-    if (!process.env.VERCEL && !cachedApp._listening) {
-       const PORT = process.env.PORT || 3000;
-       cachedApp.listen(PORT, "0.0.0.0", () => {
-         console.log(`Server listening on ${PORT}`);
-         cachedApp._listening = true;
-       });
-    }
-
-    return cachedApp(req, res);
+    const app = await appPromise;
+    return app(req, res);
   } catch (err: any) {
     console.error("[BOOT ERROR]", err);
     if (!res.headersSent) {
-      res.status(500).end(`Internal Startup Error: ${err.message}`);
+      res.status(500).send(`Neural Engine Boot Failure: ${err.message}`);
     }
   }
 };
