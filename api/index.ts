@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import path from "path";
 import { GoogleGenAI, Type } from "@google/genai";
@@ -536,6 +537,10 @@ ${content.substring(0, 30000)}`;
       appType: "spa",
     });
     app.use(vite.middlewares);
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => {
+      console.log(`[SYSTEM] Server listening on port ${PORT}`);
+    });
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
@@ -571,4 +576,10 @@ export default async (req: any, res: any) => {
       res.status(500).send(`Neural Engine Boot Failure: ${err.message}`);
     }
   }
+};
+
+export const config = {
+  api: {
+    bodyParser: false,
+  },
 };
