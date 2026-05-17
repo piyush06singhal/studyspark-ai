@@ -4,6 +4,19 @@ import { GoogleGenAI, Type } from "@google/genai";
 import Groq from "groq-sdk";
 import Busboy from "busboy";
 
+// Polyfill for DOMMatrix which is sometimes missing in Node.js environments and required by pdf.js (inner dependency of pdf-parse)
+if (typeof global.DOMMatrix === 'undefined') {
+  (global as any).DOMMatrix = class DOMMatrix {
+    a = 1; b = 0; c = 0; d = 1; e = 0; f = 0;
+    constructor(init?: any) {
+      if (typeof init === 'string') return;
+      if (Array.isArray(init)) {
+        this.a = init[0]; this.b = init[1]; this.c = init[2]; this.d = init[3]; this.e = init[4]; this.f = init[5];
+      }
+    }
+  };
+}
+
 async function startServer() {
   console.log("[SYSTEM] Initializing server sequence...");
   const app = express();
@@ -268,6 +281,115 @@ async function startServer() {
     }
   });
 
+  // New API Route: Generate Flashcards
+  app.post("/api/generate-flashcards", async (req, res) => {
+    const { content } = req.body;
+    if (!content) return res.status(400).json({ error: "Content is required" });
+
+    try {
+      const prompt = `Generate a set of 8-12 high-yield flashcards (Anki-style) based on the provided text.
+Each flashcard must have a 'front' (question or term) and a 'back' (answer or definition).
+Focus on core concepts, definitions, and causal relationships.
+
+SOURCE CONTENT:
+${content.substring(0, 30000)}`;
+
+      const result = await callLLM({
+        geminiPrompt: prompt,
+        groqPrompt: prompt,
+        jsonSchema: {
+          type: Type.OBJECT,
+          properties: {
+            flashcards: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  front: { type: Type.STRING },
+                  back: { type: Type.STRING },
+                  category: { type: Type.STRING }
+                },
+                required: ["front", "back"]
+              }
+            }
+          },
+          required: ["flashcards"]
+        }
+      });
+
+      res.json(JSON.parse(result.text || '{"flashcards": []}'));
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // New API Route: Extract Insights
+  app.post("/api/extract-insights", async (req, res) => {
+    const { content } = req.body;
+    if (!content) return res.status(400).json({ error: "Content is required" });
+
+    try {
+      const prompt = `Analyze the following technical document and extract "Hidden Connections" and "Critical Vulnerabilities" in the logic or findings.
+Provide a list of "Deep Insights" that aren't immediately obvious but are supported by the data.
+
+FORMAT: Use Markdown with distinct sections.
+
+SOURCE CONTENT:
+${content.substring(0, 30000)}`;
+
+      const result = await callLLM({
+        geminiPrompt: prompt,
+        groqPrompt: prompt
+      });
+
+      res.json({ insights: result.text });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // New API Route: Topic Analysis
+  app.post("/api/topic-analysis", async (req, res) => {
+    const { content } = req.body;
+    if (!content) return res.status(400).json({ error: "Content is required" });
+
+    try {
+      const prompt = `Analyze the provided source text and identify the top 5-7 most important academic or technical topics.
+For each topic, provide a 'relevance' score from 1-100 and a 1-sentence 'description' of how it is addressed in the text.
+
+SOURCE CONTENT:
+${content.substring(0, 30000)}`;
+
+      const result = await callLLM({
+        geminiPrompt: prompt,
+        groqPrompt: prompt,
+        jsonSchema: {
+          type: Type.OBJECT,
+          properties: {
+            topics: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  name: { type: Type.STRING },
+                  relevance: { type: Type.NUMBER },
+                  description: { type: Type.STRING }
+                },
+                required: ["name", "relevance", "description"]
+              }
+            }
+          },
+          required: ["topics"]
+        }
+      });
+
+      res.json(JSON.parse(result.text || '{"topics": []}'));
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // New API Route: Semantic Chat
   app.post("/api/chat", async (req, res) => {
     const { message, history, content } = req.body;
     if (!content) return res.status(400).json({ error: "Context is required" });
@@ -284,6 +406,109 @@ async function startServer() {
       });
 
       res.json({ response: result.text });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // New API Route: Knowledge Graph
+  app.post("/api/knowledge-graph", async (req, res) => {
+    const { content } = req.body;
+    if (!content) return res.status(400).json({ error: "Content is required" });
+
+    try {
+      const prompt = `You are a Semantic Cartographer. Analyze the provided document and construct a high-fidelity Knowledge Graph.
+Extract key technical entities, concepts, dates, and figures as nodes.
+Define explicit relationships between these entities as links.
+
+SOURCE CONTENT:
+${content.substring(0, 30000)}`;
+
+      const result = await callLLM({
+        geminiPrompt: prompt,
+        groqPrompt: prompt,
+        jsonSchema: {
+          type: Type.OBJECT,
+          properties: {
+            nodes: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  id: { type: Type.STRING },
+                  group: { type: Type.NUMBER },
+                  val: { type: Type.NUMBER }
+                },
+                required: ["id", "group", "val"]
+              }
+            },
+            links: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  source: { type: Type.STRING },
+                  target: { type: Type.STRING },
+                  value: { type: Type.NUMBER }
+                },
+                required: ["source", "target", "value"]
+              }
+            }
+          },
+          required: ["nodes", "links"]
+        }
+      });
+
+      const parsed = JSON.parse(result.text || '{"nodes":[], "links":[]}');
+      res.json(parsed);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // New API Route: Predictive Assessment
+  app.post("/api/predictive-assessment", async (req, res) => {
+    const { results, content } = req.body;
+    if (!content || !results) return res.status(400).json({ error: "Context and results are required" });
+
+    try {
+      const prompt = `Analyze the user's quiz results and predict areas of future difficulty based on the source document.
+      DOC: ${content.substring(0, 30000)}
+      RESULTS: ${JSON.stringify(results)}`;
+
+      const result = await callLLM({
+        geminiPrompt: prompt,
+        groqPrompt: prompt
+      });
+
+      res.json({ assessment: result.text });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // New API Route: Multimodal Fact Check
+  app.post("/api/fact-check", async (req, res) => {
+    const { claims, content } = req.body;
+    if (!content) return res.status(400).json({ error: "Context is required" });
+
+    try {
+      const prompt = `Cross-reference claims with the source text and external research.
+      DOC: ${content.substring(0, 5000)}
+      CLAIMS: ${claims}`;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-1.5-flash",
+        contents: prompt,
+        config: {
+          tools: [{ googleSearch: {} }],
+        },
+      });
+
+      res.json({ 
+        analysis: response.text,
+        sources: response.candidates?.[0]?.groundingMetadata?.groundingChunks?.map((g: any) => g.web?.uri).filter(Boolean) || []
+      });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
