@@ -11,8 +11,6 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json({ limit: '10mb' }));
-
   const clientGeminiKey = process.env.GEMINI_API_KEY;
   const clientGroqKey = process.env.GROQ_API_KEY;
 
@@ -54,11 +52,8 @@ async function startServer() {
     } catch (geminiError: any) {
       console.error("Gemini failed:", geminiError);
       
-      // If quota exceeded and we haven't retried yet, maybe wait briefly? 
-      // But 429s usually need a longer wait. Let's try Groq immediately if it's a quota issue.
       const isQuotaError = geminiError?.message?.includes("429") || geminiError?.status === 429;
 
-      // Fallback to Groq
       if (groq) {
         try {
           console.log("Attempting Groq fallback...");
@@ -80,7 +75,6 @@ async function startServer() {
         } catch (groqError: any) {
           console.error("Groq fallback also failed:", groqError);
           
-          // If both failed and it's a retryable error, try one more time after a delay
           if (retryCount < 1 && (isQuotaError || groqError?.status === 429)) {
              console.log("Both services hit rate limits. Retrying in 2 seconds...");
              await new Promise(r => setTimeout(r, 2000));
@@ -94,6 +88,7 @@ async function startServer() {
     }
   }
 
+  // IMPORTANT: Move upload route BEFORE express.json middleware to avoid body size limits being applied by middleware to multipart/form-data
   // API Route: Extract text from PDF
   app.post("/api/upload", (req, res) => {
     const busboy = Busboy({ headers: req.headers });
@@ -104,42 +99,48 @@ async function startServer() {
 
     busboy.on("file", (fieldname, file, info) => {
       fileName = info.filename;
-      console.log(`Receiving file: ${fileName}, mime: ${info.mimeType}`);
+      console.log(`[STORAGE] Receiving file: ${fileName}, mime: ${info.mimeType}`);
       const chunks: Buffer[] = [];
-      file.on("data", (chunk) => chunks.push(chunk));
+      file.on("data", (chunk) => {
+        chunks.push(chunk);
+      });
       
       const promise = new Promise((resolve) => {
         file.on("end", async () => {
           const buffer = Buffer.concat(chunks);
-          console.log(`File ${fileName} fully received. Size: ${buffer.length} bytes`);
+          console.log(`[STORAGE] File ${fileName} fully received. Size: ${buffer.length} bytes`);
           try {
             if (info.mimeType === "application/pdf") {
-              console.log("Parsing PDF...");
+              console.log("[NERAL] Parsing PDF stream...");
               try {
-                const result = await pdf(buffer);
+                // Runtime check for pdf-parse export variability
+                const parsePdf = (pdf as any).default || pdf;
+                const result = await parsePdf(buffer);
+                
                 if (result && result.text) {
                   text = result.text;
-                  console.log(`PDF parsed. Extracted text length: ${text.length}`);
+                  console.log(`[NEURAL] PDF parsed. Extracted text length: ${text.length}`);
                 } else {
-                  throw new Error("PDF parser returned no text. The PDF might be scanned/image-based.");
+                  throw new Error("NULL_EXTRACTION: PDF parser returned no text. The document might be image-based or protected.");
                 }
               } catch (err: any) {
+                console.error("[NEURAL] PDF Parse Error:", err);
                 throw err;
               }
             } else {
               text = buffer.toString("utf-8");
-              console.log(`Text file parsed. Length: ${text.length}`);
+              console.log(`[STORAGE] Text file parsed. Length: ${text.length}`);
             }
             resolve(true);
           } catch (err: any) {
-            console.error("PDF/File Parse Error:", err);
+            console.error("[STORAGE] Processing Error:", err);
             errorOccurred = true;
             text = `ERROR: ${err.message}`;
             resolve(false);
           }
         });
         file.on("error", (err) => {
-          console.error("File Stream Error:", err);
+          console.error("[STREAM] File Stream Error:", err);
           errorOccurred = true;
           resolve(false);
         });
@@ -148,17 +149,20 @@ async function startServer() {
     });
 
     busboy.on("finish", async () => {
+      console.log("[STORAGE] Busboy stream finished.");
       await Promise.all(processingPromises);
       if (errorOccurred || !text) {
+        console.error("[STORAGE] Upload terminal state failure.");
         return res.status(500).json({ 
           error: text.startsWith("ERROR:") ? text.replace("ERROR: ", "") : "Failed to extract text from the document. It might be corrupted or in an unsupported format." 
         });
       }
+      console.log("[STORAGE] Upload success.");
       res.json({ text, fileName });
     });
 
     busboy.on("error", (err) => {
-      console.error("Busboy Error:", err);
+      console.error("[STORAGE] Busboy Global Error:", err);
       if (!res.headersSent) {
         res.status(500).json({ error: "Communication error during upload." });
       }
@@ -166,6 +170,8 @@ async function startServer() {
 
     req.pipe(busboy);
   });
+
+  app.use(express.json({ limit: '50mb' })); // Increased limit for JSON requests if needed
 
   // API Route: Generate Quiz
   app.post("/api/generate-quiz", async (req, res) => {

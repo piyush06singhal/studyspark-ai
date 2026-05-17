@@ -47,6 +47,13 @@ export default function UploadPage() {
 
   const handleUpload = async () => {
     if (!file) return;
+
+    // Client-side guard for Vercel's 4.5MB payload limit
+    if (file.size > 4.5 * 1024 * 1024) {
+      setError("Document too large. The neural context buffer is limited to 4.5MB. Please compress the file or use Manual Entry.");
+      return;
+    }
+
     setUploading(true);
     setProgress(10);
     setError(null);
@@ -65,11 +72,14 @@ export default function UploadPage() {
       try {
         data = JSON.parse(text);
       } catch (e) {
-        throw new Error(`Server returned an invalid response (${response.status}). The document might be too large or complex.`);
+        if (response.status === 413) {
+          throw new Error("The file is too large for the neural engine's current buffer (Max 4.5MB on Vercel). Please try a smaller document.");
+        }
+        throw new Error(`Neural Link Error (${response.status}): The server returned an unparseable response. This usually indicates a system-level limit was exceeded.`);
       }
 
       if (!response.ok) {
-        throw new Error(data.error || "Upload failed on the server.");
+        throw new Error(data.error || "Neural extraction failed at the core layer.");
       }
       
       if (!data.text || data.text.trim().length < 50) {
