@@ -123,26 +123,31 @@ async function startServer() {
           try {
             if (info.mimeType === "application/pdf") {
               console.log("[NEURAL] Starting PDF parsing sequence...");
-              // Robust attempt at importing pdf-parse
-              let parsePdf;
               try {
-                // Try to handle different export styles in serverless environments
-                parsePdf = (pdf as any).default || pdf;
-                if (typeof parsePdf !== 'function') {
-                  throw new Error("PDF_MODULE_CONFIG_ERROR: pdf-parse export is not a function.");
+                // Robust check for different import styles
+                let parsePdfFunc = (pdf as any).default || pdf;
+                
+                // Final fallback if it's still not a function
+                if (typeof parsePdfFunc !== 'function' && (pdf as any).pdf) {
+                   parsePdfFunc = (pdf as any).pdf;
                 }
-              } catch (importErr: any) {
-                console.error("[NEURAL] PDF Module Import Failure:", importErr);
-                throw new Error("SYSTEM_MODULE_ERROR: Could not initialize neural extraction engine.");
-              }
 
-              const result = await parsePdf(buffer);
-              
-              if (result && result.text) {
-                extractedText = result.text;
-                console.log(`[NEURAL] PDF parsed successfully. Lines: ${extractedText.split('\n').length}`);
-              } else {
-                throw new Error("EMPTY_EXTRACTION: No recognizable text was found in this document.");
+                if (typeof parsePdfFunc !== 'function') {
+                  console.error("[NEURAL] PDF module structure:", typeof pdf, Object.keys(pdf as any));
+                  throw new Error("PDF_PARSER_INIT_ERROR: The extraction engine could not be initialized.");
+                }
+                
+                const result = await parsePdfFunc(buffer);
+                
+                if (result && result.text) {
+                  extractedText = result.text;
+                  console.log(`[NEURAL] PDF parsed successfully. Lines: ${extractedText.split('\n').length}`);
+                } else {
+                  throw new Error("EMPTY_EXTRACTION: No recognizable text was found in this document.");
+                }
+              } catch (pdfErr: any) {
+                console.error("[NEURAL] PDF Parsing failed internally:", pdfErr);
+                throw pdfErr;
               }
             } else {
               extractedText = buffer.toString("utf-8");
@@ -604,9 +609,19 @@ RULES:
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
-  });
+  // Only listen if not in a serverless environment
+  if (process.env.NODE_ENV !== "production" || !process.env.VERCEL) {
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server running on http://0.0.0.0:${PORT}`);
+    });
+  }
+  
+  return app;
 }
 
-startServer();
+const appPromise = startServer();
+
+export default async (req: any, res: any) => {
+  const app = await appPromise;
+  return app(req, res);
+};
